@@ -17,6 +17,7 @@
 
 #define BLOCK_SIZE (BLOCK_X * BLOCK_Y)
 #define NUM_WARPS (BLOCK_SIZE/32)
+
 // Spherical harmonics coefficients
 __device__ const float SH_C0 = 0.28209479177387814f;
 __device__ const float SH_C1 = 0.4886025119029199f;
@@ -37,10 +38,6 @@ __device__ const float SH_C3[] = {
 	-0.5900435899266435f
 };
 
-
-
-
-
 __forceinline__ __device__ float ndc2Pix(float v, int S)
 {
 	return ((v + 1.0) * S - 1.0) * 0.5;
@@ -57,6 +54,19 @@ __forceinline__ __device__ void getRect(const float2 p, int max_radius, uint2& r
 		min(grid.y, max((int)0, (int)((p.y + max_radius + BLOCK_Y - 1) / BLOCK_Y)))
 	};
 }
+
+__forceinline__ __device__ void getRect(const float2 p, int2 ext_rect, uint2& rect_min, uint2& rect_max, dim3 grid)
+{
+	rect_min = {
+		min(grid.x, max((int)0, (int)((p.x - ext_rect.x) / BLOCK_X))),
+		min(grid.y, max((int)0, (int)((p.y - ext_rect.y) / BLOCK_Y)))
+	};
+	rect_max = {
+		min(grid.x, max((int)0, (int)((p.x + ext_rect.x + BLOCK_X - 1) / BLOCK_X))),
+		min(grid.y, max((int)0, (int)((p.y + ext_rect.y + BLOCK_Y - 1) / BLOCK_Y)))
+	};
+}
+
 
 __forceinline__ __device__ float3 transformPoint4x3(const float3& p, const float* matrix)
 {
@@ -164,15 +174,6 @@ __forceinline__ __device__ bool in_frustum(int idx,
 		return false;
 	}
 	return true;
-}
-
-#define CHECK_CUDA(A, debug) \
-A; if(debug) { \
-auto ret = cudaDeviceSynchronize(); \
-if (ret != cudaSuccess) { \
-std::cerr << "\n[CUDA ERROR] in " << __FILE__ << "\nLine " << __LINE__ << ": " << cudaGetErrorString(ret); \
-throw std::runtime_error(cudaGetErrorString(ret)); \
-} \
 }
 
 #endif

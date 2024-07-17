@@ -208,7 +208,10 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float5* conic_opacity,
 	const dim3 grid,
 	uint32_t* tiles_touched,
-	bool prefiltered)
+	bool prefiltered,
+	int2* rects,
+	float3 boxmin,
+	float3 boxmax)
 {
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= P)
@@ -226,6 +229,11 @@ __global__ void preprocessCUDA(int P, int D, int M,
 
 	// Transform point by projecting
 	float3 p_orig = { orig_points[3 * idx], orig_points[3 * idx + 1], orig_points[3 * idx + 2] };
+
+	if (p_orig.x < boxmin.x || p_orig.y < boxmin.y || p_orig.z < boxmin.z ||
+		p_orig.x > boxmax.x || p_orig.y > boxmax.y || p_orig.z > boxmax.z)
+		return;
+
 	float4 p_hom = transformPoint4x4(p_orig, projmatrix);
 	float p_w = 1.0f / (p_hom.w + 0.0000001f);
 	float3 p_proj = { p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w };
@@ -249,7 +257,6 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	if(isnan(renorm)){
 		printf("%f, %f %f\n", log(sqrt(max(0.00000001,2*3.1415926f/computeCov3D_inv_last(scales[idx], scale_modifier, rotations[idx])))),max(0.001,2*3.1415926f/computeCov3D_inv_last(scales[idx], scale_modifier, rotations[idx])),computeCov3D_inv_last(scales[idx], scale_modifier, rotations[idx]));
 	}
-	//float renorm = 0.f;
 	// Invert covariance (EWA algorithm)
 	float det = (cov.x * cov.z - cov.y * cov.y);
 	if (det == 0.0f)
@@ -261,12 +268,12 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	// 2D covariance matrix). Use extent to compute a bounding rectangle
 	// of screen-space tiles that this Gaussian overlaps with. Quit if
 	// rectangle covers 0 tiles. 
+
 	float mid = 0.5f * (cov.x + cov.z);
 	float lambda1 = mid + sqrt(max(0.1f, mid * mid - det));
 	float lambda2 = mid - sqrt(max(0.1f, mid * mid - det));
 	const float my_con_o_w = opacities[idx]+renorm;
-	//float my_radius = ceil(3.f * sqrt(max(lambda1, lambda2)));
-	//float my_radius = ceil(2*sqrt(max(0.f, my_con_o_w + 9.f) * max(lambda1, lambda2)));
+	//float my_radius = ceil(sqrt((max(my_con_o_w,0.f)+9.f) * max(lambda1, lambda2)));
 	float my_radius = ceil(2*sqrt(max(0.f, my_con_o_w + 9.f) * max(lambda1, lambda2)));
 	if (isnan(my_radius) || isinf(my_radius) || my_radius <= 0){
 		//printf("my_radius: %f\n", my_radius);
@@ -274,7 +281,18 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	}
 	float2 point_image = { ndc2Pix(p_proj.x, W), ndc2Pix(p_proj.y, H) };
 	uint2 rect_min, rect_max;
-	getRect(point_image, my_radius, rect_min, rect_max, grid);
+
+	if (rects == nullptr) 	// More conservative
+	{
+		getRect(point_image, my_radius, rect_min, rect_max, grid);
+	}
+	else // Slightly more aggressive, might need a math cleanup
+	{
+		const int2 my_rect = { (int)ceil(sqrt(2*max(my_con_o_w+9.f,0.f) * cov.x)), (int)ceil(sqrt(2*max(my_con_o_w+9.f,0.f) * cov.z)) };
+		rects[idx] = my_rect;
+		getRect(point_image, my_rect, rect_min, rect_max, grid);
+	}
+
 	if ((rect_max.x - rect_min.x) * (rect_max.y - rect_min.y) == 0)
 		return;
 
@@ -293,7 +311,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	radii[idx] = my_radius;
 	points_xy_image[idx] = point_image;
 	// Inverse 2D covariance and opacity neatly pack into one float4
-	conic_opacity[idx] = { conic.x, conic.y, conic.z, opacities[idx], renorm};
+	conic_opacity[idx] = { conic.x, conic.y, conic.z, opacities[idx],renorm };
 	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
 }
 
@@ -374,19 +392,20 @@ renderCUDA(
 			float2 xy = collected_xy[j];
 			float2 d = { xy.x - pixf.x, xy.y - pixf.y };
 			float5 con_o = collected_conic_opacity[j];
-			float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
+			float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;	
 			if (power > 0.0f)
 				continue;
 			power+=con_o.w+con_o.v;
-			if(false){
-				printf("power: %f\n", power);
-			}
+			/*if(con_o.w < 0.0f){
+				printf("Negative opacity\n");
+			}*/
 			// Eq. (2) from 3D Gaussian splatting paper.
 			// Obtain alpha by multiplying with Gaussian opacity
 			// and its exponential falloff from mean.
 			// Avoid numerical instabilities (see paper appendix). 
-			float alpha = min(0.99f, 1-expf(-expf(power)));
-			if (alpha < 1.0f / 255.0f || isnan(alpha))
+			//float alpha = min(0.99f, con_o.w * exp(power));
+			float alpha = min(0.99f, 1-exp(-exp(power)));
+			if (alpha < 1.0f / 255.0f)
 				continue;
 			float test_T = T * (1 - alpha);
 			if (test_T < 0.0001f)
@@ -468,7 +487,10 @@ void FORWARD::preprocess(int P, int D, int M,
 	float5* conic_opacity,
 	const dim3 grid,
 	uint32_t* tiles_touched,
-	bool prefiltered)
+	bool prefiltered,
+	int2* rects,
+	float3 boxmin,
+	float3 boxmax)
 {
 	preprocessCUDA<NUM_CHANNELS> << <(P + 255) / 256, 256 >> > (
 		P, D, M,
@@ -495,6 +517,9 @@ void FORWARD::preprocess(int P, int D, int M,
 		conic_opacity,
 		grid,
 		tiles_touched,
-		prefiltered
+		prefiltered,
+		rects,
+		boxmin,
+		boxmax
 		);
 }
