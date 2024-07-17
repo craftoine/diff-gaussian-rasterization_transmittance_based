@@ -17,7 +17,6 @@
 
 #define BLOCK_SIZE (BLOCK_X * BLOCK_Y)
 #define NUM_WARPS (BLOCK_SIZE/32)
-
 // Spherical harmonics coefficients
 __device__ const float SH_C0 = 0.28209479177387814f;
 __device__ const float SH_C1 = 0.4886025119029199f;
@@ -37,6 +36,10 @@ __device__ const float SH_C3[] = {
 	1.445305721320277f,
 	-0.5900435899266435f
 };
+
+
+
+
 
 __forceinline__ __device__ float ndc2Pix(float v, int S)
 {

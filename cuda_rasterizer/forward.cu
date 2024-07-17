@@ -8,7 +8,7 @@
  *
  * For inquiries contact  george.drettakis@inria.fr
  */
-
+#include "float5.h"
 #include "forward.h"
 #include "auxiliary.h"
 #include <cooperative_groups.h>
@@ -107,8 +107,8 @@ __device__ float3 computeCov2D(const float3& mean, float focal_x, float focal_y,
 
 	// Apply low-pass filter: every Gaussian should be at least
 	// one pixel wide/high. Discard 3rd row and column.
-	cov[0][0] += 0.3f;
-	cov[1][1] += 0.3f;
+	//cov[0][0] += 0.3f;
+	//cov[1][1] += 0.3f;
 	return { float(cov[0][0]), float(cov[0][1]), float(cov[1][1]) };
 }
 
@@ -150,7 +150,38 @@ __device__ void computeCov3D(const glm::vec3 scale, float mod, const glm::vec4 r
 	cov3D[4] = Sigma[1][2];
 	cov3D[5] = Sigma[2][2];
 }
+__device__ float computeCov3D_inv_last(const glm::vec3 scale, float mod, const glm::vec4 rot)
+{
+	// Create scaling matrix
+	glm::mat3 S = glm::mat3(1.0f);
+	//S[0][0] = 1/(abs(mod * scale.x )+ sqrt(0.3));
+	//S[1][1] = 1/(abs(mod * scale.y )+ sqrt(0.3));
+	//S[2][2] = 1/(abs(mod * scale.z )+ sqrt(0.3));
+	S[0][0] = 1/(abs(mod * scale.x ));
+	S[1][1] = 1/(abs(mod * scale.y ));
+	S[2][2] = 1/(abs(mod * scale.z ));
+	// Normalize quaternion to get valid rotation
+	glm::vec4 q = rot;// / glm::length(rot);
+	float r = q.x;
+	float x = q.y;
+	float y = q.z;
+	float z = q.w;
 
+	// Compute rotation matrix from quaternion
+	glm::mat3 R = glm::mat3(
+		1.f - 2.f * (y * y + z * z), 2.f * (x * y - r * z), 2.f * (x * z + r * y),
+		2.f * (x * y + r * z), 1.f - 2.f * (x * x + z * z), 2.f * (y * z - r * x),
+		2.f * (x * z - r * y), 2.f * (y * z + r * x), 1.f - 2.f * (x * x + y * y)
+	);
+
+	glm::mat3 M = S * R;
+
+	// Compute 3D world covariance matrix Sigma
+	glm::mat3 Sigma = glm::transpose(M) * M;
+
+	// Covariance is symmetric, only store upper right
+	return Sigma[2][2];
+}
 // Perform initial steps for each Gaussian prior to rasterization.
 template<int C>
 __global__ void preprocessCUDA(int P, int D, int M,
@@ -174,7 +205,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float* depths,
 	float* cov3Ds,
 	float* rgb,
-	float4* conic_opacity,
+	float5* conic_opacity,
 	const dim3 grid,
 	uint32_t* tiles_touched,
 	bool prefiltered)
@@ -214,7 +245,11 @@ __global__ void preprocessCUDA(int P, int D, int M,
 
 	// Compute 2D screen-space covariance matrix
 	float3 cov = computeCov2D(p_orig, focal_x, focal_y, tan_fovx, tan_fovy, cov3D, viewmatrix);
-
+	float renorm =log(sqrt(max(0.00000001,2*3.1415926f/computeCov3D_inv_last(scales[idx], scale_modifier, rotations[idx]))));
+	if(isnan(renorm)){
+		printf("%f, %f %f\n", log(sqrt(max(0.00000001,2*3.1415926f/computeCov3D_inv_last(scales[idx], scale_modifier, rotations[idx])))),max(0.001,2*3.1415926f/computeCov3D_inv_last(scales[idx], scale_modifier, rotations[idx])),computeCov3D_inv_last(scales[idx], scale_modifier, rotations[idx]));
+	}
+	//float renorm = 0.f;
 	// Invert covariance (EWA algorithm)
 	float det = (cov.x * cov.z - cov.y * cov.y);
 	if (det == 0.0f)
@@ -229,7 +264,14 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float mid = 0.5f * (cov.x + cov.z);
 	float lambda1 = mid + sqrt(max(0.1f, mid * mid - det));
 	float lambda2 = mid - sqrt(max(0.1f, mid * mid - det));
-	float my_radius = ceil(3.f * sqrt(max(lambda1, lambda2)));
+	const float my_con_o_w = opacities[idx]+renorm;
+	//float my_radius = ceil(3.f * sqrt(max(lambda1, lambda2)));
+	//float my_radius = ceil(2*sqrt(max(0.f, my_con_o_w + 9.f) * max(lambda1, lambda2)));
+	float my_radius = ceil(2*sqrt(max(0.f, my_con_o_w + 9.f) * max(lambda1, lambda2)));
+	if (isnan(my_radius) || isinf(my_radius) || my_radius <= 0){
+		//printf("my_radius: %f\n", my_radius);
+		return;
+	}
 	float2 point_image = { ndc2Pix(p_proj.x, W), ndc2Pix(p_proj.y, H) };
 	uint2 rect_min, rect_max;
 	getRect(point_image, my_radius, rect_min, rect_max, grid);
@@ -251,7 +293,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	radii[idx] = my_radius;
 	points_xy_image[idx] = point_image;
 	// Inverse 2D covariance and opacity neatly pack into one float4
-	conic_opacity[idx] = { conic.x, conic.y, conic.z, opacities[idx] };
+	conic_opacity[idx] = { conic.x, conic.y, conic.z, opacities[idx], renorm};
 	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
 }
 
@@ -266,7 +308,7 @@ renderCUDA(
 	int W, int H,
 	const float2* __restrict__ points_xy_image,
 	const float* __restrict__ features,
-	const float4* __restrict__ conic_opacity,
+	const float5* __restrict__ conic_opacity,
 	float* __restrict__ final_T,
 	uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ bg_color,
@@ -294,7 +336,7 @@ renderCUDA(
 	// Allocate storage for batches of collectively fetched data.
 	__shared__ int collected_id[BLOCK_SIZE];
 	__shared__ float2 collected_xy[BLOCK_SIZE];
-	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
+	__shared__ float5 collected_conic_opacity[BLOCK_SIZE];
 
 	// Initialize helper variables
 	float T = 1.0f;
@@ -331,17 +373,20 @@ renderCUDA(
 			// Splatting" by Zwicker et al., 2001)
 			float2 xy = collected_xy[j];
 			float2 d = { xy.x - pixf.x, xy.y - pixf.y };
-			float4 con_o = collected_conic_opacity[j];
+			float5 con_o = collected_conic_opacity[j];
 			float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
 			if (power > 0.0f)
 				continue;
-
+			power+=con_o.w+con_o.v;
+			if(false){
+				printf("power: %f\n", power);
+			}
 			// Eq. (2) from 3D Gaussian splatting paper.
 			// Obtain alpha by multiplying with Gaussian opacity
 			// and its exponential falloff from mean.
 			// Avoid numerical instabilities (see paper appendix). 
-			float alpha = min(0.99f, con_o.w * exp(power));
-			if (alpha < 1.0f / 255.0f)
+			float alpha = min(0.99f, 1-expf(-expf(power)));
+			if (alpha < 1.0f / 255.0f || isnan(alpha))
 				continue;
 			float test_T = T * (1 - alpha);
 			if (test_T < 0.0001f)
@@ -380,7 +425,7 @@ void FORWARD::render(
 	int W, int H,
 	const float2* means2D,
 	const float* colors,
-	const float4* conic_opacity,
+	const float5* conic_opacity,
 	float* final_T,
 	uint32_t* n_contrib,
 	const float* bg_color,
@@ -420,7 +465,7 @@ void FORWARD::preprocess(int P, int D, int M,
 	float* depths,
 	float* cov3Ds,
 	float* rgb,
-	float4* conic_opacity,
+	float5* conic_opacity,
 	const dim3 grid,
 	uint32_t* tiles_touched,
 	bool prefiltered)

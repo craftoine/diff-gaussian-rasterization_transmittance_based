@@ -8,7 +8,7 @@
  *
  * For inquiries contact  george.drettakis@inria.fr
  */
-
+#include "float5.h"
 #include "rasterizer_impl.h"
 #include <iostream>
 #include <fstream>
@@ -401,7 +401,7 @@ void CudaRasterizer::Rasterizer::backward(
 		imgState.n_contrib,
 		dL_dpix,
 		(float3*)dL_dmean2D,
-		(float4*)dL_dconic,
+		(float5*)dL_dconic,
 		dL_dopacity,
 		dL_dcolor), debug)
 
